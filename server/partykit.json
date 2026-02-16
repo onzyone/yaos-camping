@@ -1,0 +1,6 @@
+{
+	"$schema": "https://www.partykit.io/schema.json",
+	"name": "vault-crdt-sync",
+	"main": "src/server.ts",
+	"compatibilityDate": "2024-09-01"
+}

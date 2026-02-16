@@ -1,0 +1,19 @@
+{
+	"name": "vault-crdt-sync-server",
+	"version": "0.1.0",
+	"private": true,
+	"description": "PartyKit server for Obsidian vault CRDT sync via y-partykit",
+	"scripts": {
+		"dev": "npx partykit dev",
+		"deploy": "npx partykit deploy",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"partykit": "^0.0.111",
+		"y-partykit": "^0.0.25",
+		"yjs": "^13.6.20"
+	},
+	"devDependencies": {
+		"typescript": "^5.8.3"
+	}
+}
