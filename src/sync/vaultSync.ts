@@ -2,7 +2,7 @@ import * as Y from "yjs";
 import YPartyKitProvider from "y-partykit/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import { normalizePath } from "obsidian";
-import { type FileMeta, ORIGIN_SEED } from "../types";
+import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone, ORIGIN_SEED } from "../types";
 import type { VaultSyncSettings } from "../settings";
 
 /** Current schema version. Stored in sys.schemaVersion. */
@@ -32,10 +32,13 @@ export type ReconcileMode = "conservative" | "authoritative";
  * persistence, and the shared Yjs maps.
  *
  * Schema:
- *   pathToId: Y.Map<string>    — vault-relative path -> stable fileId
- *   idToText: Y.Map<Y.Text>    — fileId -> Y.Text (markdown content)
- *   meta:     Y.Map<FileMeta>  — fileId -> metadata { path, deleted?, mtime? }
- *   sys:      Y.Map<any>       — sentinel/bookkeeping { initialized, lastSync }
+ *   pathToId:        Y.Map<string>         — vault-relative path -> stable fileId (markdown)
+ *   idToText:        Y.Map<Y.Text>         — fileId -> Y.Text (markdown content)
+ *   meta:            Y.Map<FileMeta>       — fileId -> metadata { path, deleted?, mtime? }
+ *   sys:             Y.Map<any>            — sentinel/bookkeeping { initialized, lastSync }
+ *   pathToBlob:      Y.Map<BlobRef>        — vault-relative path -> { hash, size }
+ *   blobMeta:        Y.Map<BlobMeta>       — sha256 hex -> { size, mime, createdAt }
+ *   blobTombstones:  Y.Map<BlobTombstone>  — vault-relative path -> { deletedAt, device? }
  */
 export class VaultSync {
 	readonly ydoc: Y.Doc;
@@ -46,6 +49,11 @@ export class VaultSync {
 	readonly idToText: Y.Map<Y.Text>;
 	readonly meta: Y.Map<FileMeta>;
 	readonly sys: Y.Map<unknown>;
+
+	// Blob / attachment maps (additive — schema version stays at 1)
+	readonly pathToBlob: Y.Map<BlobRef>;
+	readonly blobMeta: Y.Map<BlobMeta>;
+	readonly blobTombstones: Y.Map<BlobTombstone>;
 
 	/**
 	 * In-memory reverse map: Y.Text instance -> fileId.
@@ -91,6 +99,10 @@ export class VaultSync {
 		this.idToText = this.ydoc.getMap<Y.Text>("idToText");
 		this.meta = this.ydoc.getMap<FileMeta>("meta");
 		this.sys = this.ydoc.getMap("sys");
+
+		this.pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
+		this.blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
+		this.blobTombstones = this.ydoc.getMap<BlobTombstone>("blobTombstones");
 
 		const roomId = "v1:" + settings.vaultId;
 		const idbName = `vault-crdt-sync:${settings.vaultId}`;
@@ -394,7 +406,10 @@ export class VaultSync {
 	 */
 	getSafeReconcileMode(): ReconcileMode {
 		if (this._providerSynced) return "authoritative";
-		if (this._localReady && this.isInitialized && this.pathToId.size > 0) {
+		// Use schemaVersion presence (set atomically with initialized) as
+		// proof that IDB loaded real data. Unlike pathToId.size > 0 this
+		// correctly handles legitimately-empty-but-initialized vaults.
+		if (this._localReady && this.isInitialized && this.sys.get("schemaVersion") !== undefined) {
 			return "authoritative";
 		}
 		return "conservative";
@@ -560,6 +575,112 @@ export class VaultSync {
 	}
 
 	// -------------------------------------------------------------------
+	// Blob operations
+	// -------------------------------------------------------------------
+
+	/**
+	 * Record a blob reference for a vault path. Called after a successful
+	 * R2 upload. Sets pathToBlob + blobMeta in a single transaction.
+	 * Only sets blobMeta if the hash isn't already tracked (dedup).
+	 */
+	setBlobRef(
+		path: string,
+		hash: string,
+		size: number,
+		mime: string,
+		device?: string,
+	): void {
+		path = this.normPath(path);
+
+		this.ydoc.transact(() => {
+			this.pathToBlob.set(path, { hash, size });
+			// Only set blobMeta if this content hash is new
+			if (!this.blobMeta.has(hash)) {
+				this.blobMeta.set(hash, {
+					size,
+					mime,
+					createdAt: Date.now(),
+					device,
+				});
+			}
+			// Clear any existing tombstone for this path
+			if (this.blobTombstones.has(path)) {
+				this.blobTombstones.delete(path);
+			}
+		}, ORIGIN_SEED);
+
+		this.log(`setBlobRef: "${path}" hash=${hash.slice(0, 12)}… (${size} bytes)`);
+	}
+
+	/**
+	 * Get the blob reference for a vault path, if any.
+	 */
+	getBlobRef(path: string): BlobRef | undefined {
+		return this.pathToBlob.get(this.normPath(path));
+	}
+
+	/**
+	 * Get blob metadata for a content hash.
+	 */
+	getBlobMeta(hash: string): BlobMeta | undefined {
+		return this.blobMeta.get(hash);
+	}
+
+	/**
+	 * Tombstone-delete a blob path. Removes from pathToBlob and records
+	 * a tombstone to prevent resurrection from stale disk scans.
+	 * Does NOT delete the R2 blob (content-addressed = may be shared).
+	 */
+	deleteBlobRef(path: string, device?: string): void {
+		path = this.normPath(path);
+
+		if (!this.pathToBlob.has(path)) {
+			this.log(`deleteBlobRef: "${path}" not in CRDT, ignoring`);
+			return;
+		}
+
+		this.ydoc.transact(() => {
+			this.pathToBlob.delete(path);
+			this.blobTombstones.set(path, {
+				deletedAt: Date.now(),
+				device,
+			});
+		}, ORIGIN_SEED);
+
+		this.log(`deleteBlobRef: "${path}" tombstoned`);
+	}
+
+	/**
+	 * Check if a path is blob-tombstoned (deleted).
+	 */
+	isBlobTombstoned(path: string): boolean {
+		return this.blobTombstones.has(this.normPath(path));
+	}
+
+	/**
+	 * Rename a blob path. Moves the entry in pathToBlob.
+	 * Called from the rename batch flush for non-markdown files.
+	 */
+	renameBlobRef(oldPath: string, newPath: string): void {
+		oldPath = this.normPath(oldPath);
+		newPath = this.normPath(newPath);
+
+		const ref = this.pathToBlob.get(oldPath);
+		if (!ref) return;
+
+		this.ydoc.transact(() => {
+			this.pathToBlob.delete(oldPath);
+			this.pathToBlob.set(newPath, ref);
+			// Clear any tombstone at the new path
+			if (this.blobTombstones.has(newPath)) {
+				this.blobTombstones.delete(newPath);
+			}
+		}, ORIGIN_SEED);
+
+		this.log(`renameBlobRef: "${oldPath}" -> "${newPath}"`);
+	}
+
+	// -------------------------------------------------------------------
 	// Rename batching
 	// -------------------------------------------------------------------
 
@@ -613,21 +734,31 @@ export class VaultSync {
 
 		this.ydoc.transact(() => {
 			for (const [oldPath, newPath] of batch) {
+				// Handle markdown renames (pathToId)
 				const fileId = this.pathToId.get(oldPath);
-				if (!fileId) {
-					this.log(`renameBatch: "${oldPath}" not in CRDT, skipping`);
-					continue;
+				if (fileId) {
+					this.pathToId.delete(oldPath);
+					this.pathToId.set(newPath, fileId);
+					this.meta.set(fileId, {
+						path: newPath,
+						mtime: Date.now(),
+						device: this._device,
+					});
+
+					this.log(`renameBatch: "${oldPath}" -> "${newPath}" (id=${fileId})`);
 				}
 
-				this.pathToId.delete(oldPath);
-				this.pathToId.set(newPath, fileId);
-				this.meta.set(fileId, {
-					path: newPath,
-					mtime: Date.now(),
-					device: this._device,
-				});
-
-				this.log(`renameBatch: "${oldPath}" -> "${newPath}" (id=${fileId})`);
+				// Handle blob renames (pathToBlob)
+				const blobRef = this.pathToBlob.get(oldPath);
+				if (blobRef) {
+					this.pathToBlob.delete(oldPath);
+					this.pathToBlob.set(newPath, blobRef);
+					// Clear any tombstone at the new path
+					if (this.blobTombstones.has(newPath)) {
+						this.blobTombstones.delete(newPath);
+					}
+					this.log(`renameBatch: blob "${oldPath}" -> "${newPath}"`);
+				}
 			}
 		}, ORIGIN_SEED);
 
@@ -688,7 +819,12 @@ export class VaultSync {
 
 		const fileId = this.pathToId.get(resolvedPath);
 		if (!fileId) {
-			this.log(`handleDelete: "${resolvedPath}" not in CRDT, ignoring`);
+			// Not a markdown file — might be a blob
+			if (this.pathToBlob.has(resolvedPath)) {
+				this.deleteBlobRef(resolvedPath, device);
+			} else {
+				this.log(`handleDelete: "${resolvedPath}" not in CRDT, ignoring`);
+			}
 			return;
 		}
 
@@ -743,28 +879,36 @@ export class VaultSync {
 	 * transaction. Collects keys first to avoid mutating during iteration.
 	 * This propagates to the server via the provider (intentional for nuclear reset).
 	 */
-	clearAllMaps(): { pathCount: number; idCount: number; metaCount: number } {
+	clearAllMaps(): { pathCount: number; idCount: number; metaCount: number; blobCount: number } {
 		const pathKeys = Array.from(this.pathToId.keys());
 		const idKeys = Array.from(this.idToText.keys());
 		const metaKeys = Array.from(this.meta.keys());
 		const sysKeys = Array.from(this.sys.keys());
+		const blobPathKeys = Array.from(this.pathToBlob.keys());
+		const blobMetaKeys = Array.from(this.blobMeta.keys());
+		const blobTombKeys = Array.from(this.blobTombstones.keys());
 
 		this.ydoc.transact(() => {
 			for (const k of pathKeys) this.pathToId.delete(k);
 			for (const k of idKeys) this.idToText.delete(k);
 			for (const k of metaKeys) this.meta.delete(k);
 			for (const k of sysKeys) this.sys.delete(k);
+			for (const k of blobPathKeys) this.pathToBlob.delete(k);
+			for (const k of blobMetaKeys) this.blobMeta.delete(k);
+			for (const k of blobTombKeys) this.blobTombstones.delete(k);
 		}, ORIGIN_SEED);
 
 		this.log(
 			`clearAllMaps: removed ${pathKeys.length} paths, ` +
-			`${idKeys.length} texts, ${metaKeys.length} meta entries`,
+			`${idKeys.length} texts, ${metaKeys.length} meta entries, ` +
+			`${blobPathKeys.length} blob paths`,
 		);
 
 		return {
 			pathCount: pathKeys.length,
 			idCount: idKeys.length,
 			metaCount: metaKeys.length,
+			blobCount: blobPathKeys.length,
 		};
 	}
 
