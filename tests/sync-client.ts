@@ -1,16 +1,16 @@
 /**
- * Test client: connects to the same PartyKit room as the Obsidian plugin
+ * Test client: connects to the same sync room as the Obsidian plugin
  * and appends a line to a file's Y.Text to verify real-time sync.
  *
  * Usage: bun run test-client.ts [path] [message]
  */
 import * as Y from "yjs";
-import YPartyKitProvider from "y-partykit/provider";
+import YSyncProvider from "y-partyserver/provider";
 
-const HOST = "http://127.0.0.1:1999";
-const TOKEN = "zJ+NSVqXL1UdaNTZcDPwWMMXt/t+xFmbt5RDVC0Zbt4=";
-const VAULT_ID = "Y_V6DTp2WL2ARQZuRPaXzQ";
-const ROOM_ID = "v1:" + VAULT_ID;
+const HOST = process.env.YAOS_TEST_HOST || "http://127.0.0.1:8787";
+const TOKEN = process.env.SYNC_TOKEN || "dev-sync-token";
+const VAULT_ID = process.env.YAOS_TEST_VAULT_ID || "yaos-smoke-test";
+const ROOM_ID = VAULT_ID;
 
 const targetPath = process.argv[2] || "hi.md";
 const message = process.argv[3] || "\n\nhello from the test client — if you see this, sync works";
@@ -21,8 +21,12 @@ console.log(`Target file: "${targetPath}"`);
 const ydoc = new Y.Doc();
 const pathToId = ydoc.getMap<string>("pathToId");
 const idToText = ydoc.getMap<Y.Text>("idToText");
+const meta = ydoc.getMap("meta");
+const syncPrefix = `/vault/sync/${encodeURIComponent(ROOM_ID)}`;
+let finished = false;
 
-const provider = new YPartyKitProvider(HOST, ROOM_ID, ydoc, {
+const provider = new YSyncProvider(HOST, ROOM_ID, ydoc, {
+	prefix: syncPrefix,
 	params: { token: TOKEN },
 	connect: true,
 });
@@ -37,18 +41,20 @@ provider.on("sync", (synced: boolean) => {
 
 	console.log(`Synced. pathToId has ${pathToId.size} entries.`);
 
-	const fileId = pathToId.get(targetPath);
+	let fileId = pathToId.get(targetPath);
 	if (!fileId) {
-		console.error(`File "${targetPath}" not found in CRDT. Available paths:`);
-		pathToId.forEach((_id, path) => console.log(`  - ${path}`));
-		cleanup();
-		return;
+		fileId = `test-${Date.now().toString(36)}`;
+		const ytext = new Y.Text();
+		pathToId.set(targetPath, fileId);
+		idToText.set(fileId, ytext);
+		meta.set(fileId, { path: targetPath, mtime: Date.now() });
+		console.log(`Created "${targetPath}" (id=${fileId}) in CRDT`);
 	}
 
 	const ytext = idToText.get(fileId);
 	if (!ytext) {
 		console.error(`Y.Text not found for fileId=${fileId}`);
-		cleanup();
+		cleanup(1);
 		return;
 	}
 
@@ -58,19 +64,23 @@ provider.on("sync", (synced: boolean) => {
 	ytext.insert(ytext.length, message);
 
 	console.log("Done. New length:", ytext.length);
+	finished = true;
 
 	// Give it a moment to propagate, then exit
-	setTimeout(() => cleanup(), 1000);
+	setTimeout(() => cleanup(0), 1000);
 });
 
-function cleanup() {
+function cleanup(exitCode: number) {
+	if (finished && exitCode !== 0) {
+		exitCode = 0;
+	}
 	provider.destroy();
 	ydoc.destroy();
-	process.exit(0);
+	process.exit(exitCode);
 }
 
 // Timeout safety
 setTimeout(() => {
 	console.error("Timed out after 10s");
-	cleanup();
+	cleanup(1);
 }, 10_000);
