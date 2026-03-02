@@ -42,6 +42,12 @@ import {
 
 type SyncStatus = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
 
+type PersistedPluginState = Partial<VaultSyncSettings> & {
+	_diskIndex?: DiskIndex;
+	_blobHashCache?: BlobHashCache;
+	_blobQueue?: BlobQueueSnapshot;
+};
+
 /** Minimum interval between reconcile runs (prevents rapid reconnect churn). */
 const RECONCILE_COOLDOWN_MS = 10_000;
 
@@ -100,6 +106,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	/** Persisted blob queue snapshot for crash resilience. */
 	private savedBlobQueue: BlobQueueSnapshot | null = null;
+	private persistedState: PersistedPluginState = {};
+	private persistWriteChain: Promise<void> = Promise.resolve();
 
 	/** Pending stability checks for newly created/dropped files. */
 	private pendingStabilityChecks = new Set<string>();
@@ -1800,10 +1808,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			for (const roomPath of roomPathCandidates) {
 				const url = appendTraceParams(
-					`${host}/parties/main/${roomPath}/debug/recent?token=${encodeURIComponent(this.settings.token)}`,
+					`${host}/parties/main/${roomPath}/debug/recent`,
 					this.getTraceHttpContext(),
 				);
-				const res = await fetch(url, { method: "GET" });
+				const res = await fetch(url, {
+					method: "GET",
+					headers: {
+						Authorization: `Bearer ${this.settings.token}`,
+					},
+				});
 				if (!res.ok) {
 					lastError = new Error(`server debug fetch failed (${res.status})`);
 					continue;
@@ -1979,7 +1992,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		const data = (await this.loadData()) as Record<string, unknown> | null;
+		const data = (await this.loadData()) as PersistedPluginState | null;
+		this.persistedState = { ...(data ?? {}) };
 		this.settings = Object.assign(
 			{},
 			DEFAULT_SETTINGS,
@@ -1997,26 +2011,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (data && typeof data._blobQueue === "object" && data._blobQueue !== null) {
 			this.savedBlobQueue = data._blobQueue as BlobQueueSnapshot;
 		}
+		this.refreshPersistedState();
 	}
 
 	async saveSettings() {
-		await this.saveData({
-			...this.settings,
-			_diskIndex: this.diskIndex,
-			_blobHashCache: this.blobHashCache,
-		});
+		await this.persistPluginState();
 	}
 
 	private async saveDiskIndex(): Promise<void> {
-		// Save just the disk index without re-saving all settings
-		// (loadData includes _diskIndex, so we merge)
-		const data = (await this.loadData()) as Record<string, unknown> | null;
-		await this.saveData({
-			...data,
-			...this.settings,
-			_diskIndex: this.diskIndex,
-			_blobHashCache: this.blobHashCache,
-		});
+		await this.persistPluginState();
 	}
 
 	private async saveBlobQueue(): Promise<void> {
@@ -2024,12 +2027,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const snapshot = this.blobSync.exportQueue();
 		// Only write if there's actually something to persist
 		if (snapshot.uploads.length === 0 && snapshot.downloads.length === 0) return;
-		const data = (await this.loadData()) as Record<string, unknown> | null;
-		await this.saveData({
-			...data,
-			...this.settings,
-			_blobQueue: snapshot,
-			_blobHashCache: this.blobHashCache,
+		await this.persistPluginState((state) => {
+			state._blobQueue = snapshot;
 		});
 	}
 
@@ -2038,14 +2037,36 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * Only writes if there was previously a saved queue.
 	 */
 	private async clearSavedBlobQueue(): Promise<void> {
-		const data = (await this.loadData()) as Record<string, unknown> | null;
-		if (!data || !data._blobQueue) return;
-		delete data._blobQueue;
-		await this.saveData({
-			...data,
-			...this.settings,
-			_blobHashCache: this.blobHashCache,
+		if (!this.persistedState._blobQueue) return;
+		await this.persistPluginState((state) => {
+			delete state._blobQueue;
 		});
+	}
+
+	private refreshPersistedState(): void {
+		this.persistedState = {
+			...this.persistedState,
+			...this.settings,
+			_diskIndex: this.diskIndex,
+			_blobHashCache: this.blobHashCache,
+		};
+	}
+
+	private async persistPluginState(
+		mutate?: (state: PersistedPluginState) => void,
+	): Promise<void> {
+		// Serialize all plugin data writes so settings/index/blob queue updates
+		// cannot clobber each other with interleaved load/merge/save cycles.
+		const write = async () => {
+			this.refreshPersistedState();
+			mutate?.(this.persistedState);
+			await this.saveData({ ...this.persistedState });
+		};
+
+		this.persistWriteChain = this.persistWriteChain
+			.catch(() => undefined)
+			.then(write);
+		await this.persistWriteChain;
 	}
 
 	private buildDebugInfo(): string {
