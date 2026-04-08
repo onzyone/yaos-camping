@@ -4,10 +4,11 @@
 
 Your notes stay in sync instantly across devices, without conflicted copies, delayed file sync, or database-heavy self-hosting.
 
-<!-- TODO: Replace with hero GIF or video showing real-time sync -->
-<!-- <img src="hero.gif" alt="YAOS syncing across desktop and mobile in real time" width="720" /> -->
+<img src="https://github.com/user-attachments/assets/ee937050-8a05-4d56-9c5f-3ae5003496fc" alt="YAOS syncing a note across desktop and mobile in real time" width="720" />
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server) &nbsp; [![License: 0-BSD](https://img.shields.io/badge/license-0--BSD-green)](LICENSE)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kavinsood/yaos/tree/main/server)
+
+[![License: 0-BSD](https://img.shields.io/badge/license-0--BSD-green)](LICENSE)
 
 No terminal, no `.env` files, no database setup required.
 
