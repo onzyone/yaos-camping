@@ -1,4 +1,4 @@
-name = "yaos"
+name = "yaos-camping"
 main = "src/index.ts"
 compatibility_date = "2026-03-02"
 
